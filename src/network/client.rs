@@ -7,7 +7,7 @@ use tokio::time::timeout;
 use tracing::{debug, trace};
 
 use crate::core::crypto::{decrypt_payload, derive_session_key, encrypt_payload};
-use crate::core::protocol::{Packet, PacketType, PACKET_HEADER_SIZE};
+use crate::core::protocol::Packet;
 
 const READ_BUF_SIZE: usize = 8192;
 const CONNECT_TIMEOUT_SEC: u64 = 10;

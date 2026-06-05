@@ -1,20 +1,29 @@
+#![allow(dead_code)]
+
 mod core;
 mod network;
 mod ui;
 
 use anyhow::Result;
-use parking_lot::RwLock;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::core::account::AccountManager;
 use crate::core::events::EventScheduler;
-use crate::ui::web::launch_webview;
+use crate::ui::web::start_server;
 
 pub struct AppState {
     pub accounts: AccountManager,
     pub event_scheduler: EventScheduler,
+    pub bot_running: parking_lot::RwLock<bool>,
+    pub logs: parking_lot::RwLock<Vec<LogEntry>>,
     pub shutdown: tokio::sync::broadcast::Sender<()>,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct LogEntry {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub message: String,
 }
 
 impl AppState {
@@ -23,12 +32,27 @@ impl AppState {
         Self {
             accounts: AccountManager::new(),
             event_scheduler: EventScheduler::new(),
+            bot_running: parking_lot::RwLock::new(false),
+            logs: parking_lot::RwLock::new(Vec::new()),
             shutdown: shutdown_tx,
+        }
+    }
+
+    pub fn push_log(&self, message: impl Into<String>) {
+        let entry = LogEntry {
+            timestamp: chrono::Utc::now(),
+            message: message.into(),
+        };
+        let mut logs = self.logs.write();
+        logs.push(entry);
+        if logs.len() > 200 {
+            logs.drain(0..50);
         }
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter("bgmi_event_bot=debug,warn")
         .with_target(false)
@@ -37,29 +61,19 @@ fn main() -> Result<()> {
 
     info!("bgmi-event-bot v{}", env!("CARGO_PKG_VERSION"));
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
-
-    let state = Arc::new(RwLock::new(AppState::new()));
+    let state = Arc::new(AppState::new());
     let state_clone = state.clone();
 
-    // spawn background tasks on tokio runtime
-    rt.spawn(async move {
-        let scheduler = {
-            let s = state_clone.read();
-            s.event_scheduler.clone()
-        };
+    // spawn background event scheduler
+    tokio::spawn(async move {
+        let scheduler = state_clone.event_scheduler.clone();
         if let Err(e) = scheduler.run_loop().await {
-            warn!("event scheduler exited: {}", e);
+            tracing::warn!("event scheduler exited: {}", e);
         }
     });
 
-    // launch webview on main thread (required by tao/wry)
-    launch_webview(state)?;
+    // start web server
+    start_server(state).await?;
 
-    info!("shutting down");
-    rt.shutdown_timeout(std::time::Duration::from_secs(3));
     Ok(())
 }

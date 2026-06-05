@@ -97,7 +97,7 @@ pub fn decrypt_payload(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
 /// Compute HMAC-SHA256 for request signing
 pub fn compute_hmac(data: &[u8], key: &[u8]) -> Vec<u8> {
     let mut mac =
-        HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }

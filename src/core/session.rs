@@ -1,11 +1,10 @@
 use anyhow::{Context, Result};
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{interval, Instant};
 use tracing::{debug, error, info, warn};
 
-use super::account::{Account, ServerRegion};
+use super::account::Account;
 use super::protocol::{Packet, PacketType};
 use crate::network::client::GameClient;
 
@@ -132,6 +131,19 @@ impl GameSession {
         let mut heartbeat_tick = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SEC));
 
         loop {
+            // Try non-blocking recv on shutdown channel first
+            match self.shutdown_rx.try_recv() {
+                Ok(()) => {
+                    info!("session shutdown requested");
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    info!("shutdown channel closed");
+                    break;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+
             tokio::select! {
                 _ = heartbeat_tick.tick() => {
                     if let Err(e) = self.send_heartbeat().await {
@@ -156,10 +168,6 @@ impl GameSession {
                             warn!("recv error: {}", e);
                         }
                     }
-                }
-                _ = self.shutdown_rx.recv() => {
-                    info!("session shutdown requested");
-                    break;
                 }
             }
         }

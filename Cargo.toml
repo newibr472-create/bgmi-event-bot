@@ -7,11 +7,11 @@ description = "BGMI Event Reward Collection Bot"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-wry = "0.35"
-tao = { version = "0.24", features = ["rwh_05"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.21"
