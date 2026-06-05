@@ -3,7 +3,7 @@ use reqwest::Client;
 use std::time::Duration;
 use tracing::{debug, info};
 
-use crate::core::crypto::{compute_valid_key, gen_session_token};
+use crate::core::crypto::gen_session_token;
 use crate::core::protocol::*;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -109,7 +109,7 @@ impl BgmiClient {
         }
 
         // compute signature
-        let valid_key = compute_valid_key(&params);
+        let valid_key = String::from("TODO_CAPTURED"); // needs captured sValidKey
         params.push(("sValidKey", &valid_key));
         params.push(("sRefer", ""));
 
@@ -166,7 +166,7 @@ impl BgmiClient {
             ("sdkversion", SDK_VERSION),
         ];
 
-        let valid_key = compute_valid_key(&params);
+        let valid_key = String::from("TODO_CAPTURED"); // needs captured sValidKey
         params.push(("sValidKey", &valid_key));
         params.push(("sRefer", ""));
 
@@ -291,7 +291,7 @@ impl BgmiClient {
             ("sdkversion", SDK_VERSION),
         ];
 
-        let valid_key = compute_valid_key(&params);
+        let valid_key = String::from("TODO_CAPTURED"); // needs captured sValidKey
         params.push(("sValidKey", &valid_key));
         params.push(("sRefer", ""));
 
