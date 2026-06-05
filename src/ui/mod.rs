@@ -1,6 +1,7 @@
 pub mod web;
 
 use axum::{
+    body::Bytes,
     extract::State,
     http::StatusCode,
     response::{Html, IntoResponse, Json},
@@ -44,8 +45,20 @@ struct AddAccountRequest {
 
 async fn add_account(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<AddAccountRequest>,
+    body: Bytes,
 ) -> impl IntoResponse {
+    let payload: AddAccountRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            // try to extract token from raw body as fallback
+            let raw = String::from_utf8_lossy(&body);
+            state.push_log(format!("Import failed: {}", e));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": e.to_string(), "raw_len": raw.len()})),
+            );
+        }
+    };
     if payload.token.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
