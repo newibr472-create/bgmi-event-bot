@@ -1,168 +1,52 @@
-use bytes::{Buf, BufMut, BytesMut};
-use serde::{Deserialize, Serialize};
+/// UDP keepalive packet format - from captured TGCP traffic.
+/// All UDP packets on port 9030/9031 are exactly 22 bytes:
+/// [header: 14 bytes][marker_a: 4 bytes = 0xAAAAAAAA][marker_b: 4 bytes = 0xBBBBBBBB]
+///
+/// The header contains:
+/// [0x2A][sequence: 1 byte][0x00][timestamp: 4 bytes][hash: 6 bytes][flags: 1 byte]
+///
+/// These are TGCP keepalive pings sent every ~200ms.
+/// The game server echoes them back unchanged (request == response).
+///
+/// The actual game data (events, rewards) goes through HTTPS, not UDP.
+/// UDP is only used for realtime match gameplay.
 
-use crate::core::protocol::{PacketType, PACKET_HEADER_SIZE};
+pub const KEEPALIVE_SIZE: usize = 22;
+pub const MARKER_A: u32 = 0xAAAAAAAA;
+pub const MARKER_B: u32 = 0xBBBBBBBB;
 
-/// Higher-level packet builder with typed payloads.
-/// This wraps the raw binary protocol with structured request/response types.
+/// Game server endpoints from captures
+pub mod servers {
+    /// UDP keepalive/ping servers (port 9030 = auth, 9031 = game)
+    pub const AUTH_SERVERS: &[(&str, u16)] = &[
+        ("20.41.230.56", 9030),
+    ];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoginRequestPayload {
-    pub open_id: String,
-    pub token: String,
-    pub client_version: String,
-    pub os: String,
-    pub device_id: String,
-    pub device_model: String,
-    pub os_version: String,
-    pub language: String,
-    pub region: String,
+    pub const GAME_SERVERS: &[(&str, u16)] = &[
+        ("104.211.240.59", 9031),
+        ("20.204.189.60", 9031),
+        ("34.0.4.63", 9031),
+    ];
 }
 
-impl LoginRequestPayload {
-    pub fn new(open_id: String, token: String) -> Self {
-        Self {
-            open_id,
-            token,
-            client_version: "2.9.0".to_string(),
-            os: "android".to_string(),
-            device_id: uuid::Uuid::new_v4().to_string(),
-            device_model: "SM-G998B".to_string(),
-            os_version: "13".to_string(),
-            language: "en".to_string(),
-            region: "IN".to_string(),
-        }
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap_or_default()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoginResponsePayload {
-    pub code: i32,
-    pub msg: String,
-    pub session_token: Option<String>,
-    pub player_id: Option<String>,
-    pub server_time: Option<i64>,
-    pub lobby_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EventClaimPayload {
-    pub event_id: u32,
-    pub sub_id: Option<u32>,
-    pub timestamp: i64,
-    pub nonce: String,
-}
-
-impl EventClaimPayload {
-    pub fn new(event_id: u32) -> Self {
-        Self {
-            event_id,
-            sub_id: None,
-            timestamp: chrono::Utc::now().timestamp(),
-            nonce: uuid::Uuid::new_v4().to_string(),
-        }
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap_or_default()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PopularityClaimPayload {
-    pub event_id: u32,
-    pub target_open_id: String,
-    pub gift_type: u32,
-    pub count: u32,
-    pub timestamp: i64,
-}
-
-impl PopularityClaimPayload {
-    pub fn free_gift(target_open_id: String) -> Self {
-        Self {
-            event_id: 2001,
-            target_open_id,
-            gift_type: 1, // 1 = free, 2 = paid
-            count: 1,
-            timestamp: chrono::Utc::now().timestamp(),
-        }
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap_or_default()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MatchJoinPayload {
-    pub map_id: u32,
-    pub mode: String,
-    pub perspective: String,
-    pub squad_type: String,
-    pub timestamp: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TelemetryPayload {
-    pub event_type: String,
-    pub data: serde_json::Value,
-    pub client_ts: i64,
-    pub seq: u64,
-}
-
-impl TelemetryPayload {
-    pub fn position_update(x: f32, y: f32, z: f32, seq: u64) -> Self {
-        Self {
-            event_type: "pos".to_string(),
-            data: serde_json::json!({
-                "x": x,
-                "y": y,
-                "z": z,
-                "yaw": 0.0,
-                "state": "idle",
-            }),
-            client_ts: chrono::Utc::now().timestamp_millis(),
-            seq,
-        }
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap_or_default()
-    }
-}
-
-/// Packet frame codec for use with tokio's framed reads
-pub struct PacketCodec;
-
-impl PacketCodec {
-    /// Try to decode a complete frame from the buffer
-    pub fn decode_frame(buf: &mut BytesMut) -> Option<(PacketType, Vec<u8>)> {
-        if buf.len() < PACKET_HEADER_SIZE {
-            return None;
-        }
-
-        let ptype = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let length = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-
-        if buf.len() < PACKET_HEADER_SIZE + length {
-            return None;
-        }
-
-        buf.advance(PACKET_HEADER_SIZE);
-        let payload = buf.split_to(length).to_vec();
-        Some((PacketType::from(ptype), payload))
-    }
-
-    /// Encode a typed packet into wire format
-    pub fn encode_frame(ptype: PacketType, payload: &[u8]) -> BytesMut {
-        let mut buf = BytesMut::with_capacity(PACKET_HEADER_SIZE + payload.len());
-        buf.put_u32(ptype as u32);
-        buf.put_u32(payload.len() as u32);
-        buf.put_slice(payload);
-        buf
-    }
+/// Build a TGCP keepalive packet (for future match simulation)
+pub fn build_keepalive(sequence: u8, timestamp: u32) -> [u8; KEEPALIVE_SIZE] {
+    let mut pkt = [0u8; KEEPALIVE_SIZE];
+    pkt[0] = 0x2A;
+    pkt[1] = sequence;
+    pkt[2] = 0x00;
+    // timestamp LE
+    pkt[3..7].copy_from_slice(&timestamp.to_le_bytes());
+    // hash placeholder (from real captures this varies)
+    pkt[7] = 0xC7;
+    pkt[8] = 0x89;
+    pkt[9] = 0xB2;
+    pkt[10] = 0xD0;
+    pkt[11] = 0x5B;
+    pkt[12] = 0xA2;
+    pkt[13] = 0xC8;
+    // markers
+    pkt[14..18].copy_from_slice(&MARKER_A.to_be_bytes());
+    pkt[18..22].copy_from_slice(&MARKER_B.to_be_bytes());
+    pkt
 }

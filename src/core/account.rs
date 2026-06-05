@@ -1,142 +1,151 @@
-use anyhow::{bail, Result};
-use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use super::crypto::decrypt_token_payload;
+use crate::core::protocol::AuthCredential;
 
+/// Represents a BGMI account with all required auth data.
+/// Based on real captured parameters from HttpCanary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
-    pub display_name: String,
-    pub open_id: String,
-    pub auth_token: String,
-    pub refresh_token: Option<String>,
-    pub region: ServerRegion,
-    pub level: u32,
-    pub last_login: Option<DateTime<Utc>>,
-    pub session_active: bool,
-    pub created_at: DateTime<Utc>,
+    pub label: String,
+    pub credential: StoredCredential,
+    pub device: DeviceProfile,
+    // populated after login
+    #[serde(default)]
+    pub openid: Option<String>,
+    #[serde(default)]
+    pub inner_token: Option<String>,
+    #[serde(default)]
+    pub guid: Option<String>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub guest_id: Option<String>,
+    #[serde(default)]
+    pub last_login: Option<u64>,
+    #[serde(default)]
+    pub status: AccountStatus,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub enum ServerRegion {
-    India,
-    Korea,
-    Global,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StoredCredential {
+    Twitter {
+        oauth_token: String,
+        oauth_token_secret: String,
+    },
+    Facebook {
+        access_token: String,
+    },
+    Google {
+        id_token: String,
+    },
+    Guest,
 }
 
-impl ServerRegion {
-    pub fn gateway_host(&self) -> &'static str {
+impl StoredCredential {
+    pub fn to_auth_credential(&self) -> AuthCredential {
         match self {
-            Self::India => "bgmi-gateway.pubg.com",
-            Self::Korea => "kr-gateway.pubg.com",
-            Self::Global => "global-gateway.pubg.com",
+            Self::Twitter {
+                oauth_token,
+                oauth_token_secret,
+            } => AuthCredential::Twitter {
+                oauth_token: oauth_token.clone(),
+                oauth_token_secret: oauth_token_secret.clone(),
+            },
+            Self::Facebook { access_token } => AuthCredential::Facebook {
+                access_token: access_token.clone(),
+            },
+            Self::Google { id_token } => AuthCredential::Google {
+                id_token: id_token.clone(),
+            },
+            Self::Guest => AuthCredential::Guest {
+                guest_id: String::new(),
+            },
         }
     }
-
-    pub fn gateway_port(&self) -> u16 {
-        17500
-    }
 }
 
-#[derive(Clone)]
-pub struct AccountManager {
-    accounts: DashMap<String, Account>,
+/// Device fingerprint - must match a real device to avoid detection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceProfile {
+    pub device_id: String,     // UUID format
+    pub model: String,         // e.g. "I2405"
+    pub brand: String,         // e.g. "iQOO"
+    pub android_version: u32,  // e.g. 16
+    pub screen_density: f32,   // e.g. 2.625
+    pub screen_resolution: String, // e.g. "2400*1080"
 }
 
-impl AccountManager {
-    pub fn new() -> Self {
+impl Default for DeviceProfile {
+    fn default() -> Self {
         Self {
-            accounts: DashMap::new(),
+            device_id: uuid::Uuid::new_v4().to_string(),
+            model: "I2405".to_string(),
+            brand: "iQOO".to_string(),
+            android_version: 16,
+            screen_density: 2.625,
+            screen_resolution: "2400*1080".to_string(),
         }
     }
+}
 
-    /// Import account using auth token extracted from the game client.
-    /// Token format: base64(json{ open_id, token, ts, sig })
-    pub fn import_from_token(&self, raw_token: &str) -> Result<Account> {
-        let payload = decrypt_token_payload(raw_token)?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AccountStatus {
+    Ready,
+    LoggingIn,
+    Active,
+    Collecting,
+    Cooldown,
+    Error,
+    Banned,
+}
 
-        let open_id = payload
-            .get("open_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing open_id in token"))?
-            .to_string();
+impl Default for AccountStatus {
+    fn default() -> Self {
+        Self::Ready
+    }
+}
 
-        let token = payload
-            .get("token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing token field"))?
-            .to_string();
-
-        // check for duplicate
-        if self.accounts.iter().any(|e| e.value().open_id == open_id) {
-            bail!("account {} already imported", open_id);
+impl std::fmt::Display for AccountStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Ready => write!(f, "ready"),
+            Self::LoggingIn => write!(f, "logging_in"),
+            Self::Active => write!(f, "active"),
+            Self::Collecting => write!(f, "collecting"),
+            Self::Cooldown => write!(f, "cooldown"),
+            Self::Error => write!(f, "error"),
+            Self::Banned => write!(f, "banned"),
         }
+    }
+}
 
-        let account = Account {
-            id: Uuid::new_v4().to_string(),
-            display_name: format!("Player_{}", &open_id[..6]),
-            open_id,
-            auth_token: token,
-            refresh_token: payload.get("refresh").and_then(|v| v.as_str()).map(String::from),
-            region: ServerRegion::India,
-            level: 0,
+impl Account {
+    pub fn new(label: &str, credential: StoredCredential, device: DeviceProfile) -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
+        let guest_id = md5_hex(&id);
+
+        Self {
+            id,
+            label: label.to_string(),
+            credential,
+            device,
+            openid: None,
+            inner_token: None,
+            guid: None,
+            username: None,
+            guest_id: Some(guest_id),
             last_login: None,
-            session_active: false,
-            created_at: Utc::now(),
-        };
-
-        self.accounts.insert(account.id.clone(), account.clone());
-        Ok(account)
-    }
-
-    pub fn remove(&self, account_id: &str) -> Option<Account> {
-        self.accounts.remove(account_id).map(|(_, v)| v)
-    }
-
-    pub fn get(&self, account_id: &str) -> Option<Account> {
-        self.accounts.get(account_id).map(|r| r.value().clone())
-    }
-
-    pub fn list(&self) -> Vec<Account> {
-        self.accounts.iter().map(|r| r.value().clone()).collect()
-    }
-
-    pub fn update_session_status(&self, account_id: &str, active: bool) {
-        if let Some(mut entry) = self.accounts.get_mut(account_id) {
-            entry.session_active = active;
-            if active {
-                entry.last_login = Some(Utc::now());
-            }
+            status: AccountStatus::Ready,
         }
     }
 
-    pub fn count(&self) -> usize {
-        self.accounts.len()
+    pub fn guest_id(&self) -> &str {
+        self.guest_id.as_deref().unwrap_or("0000000000000000")
     }
+}
 
-    /// Persist accounts to disk (encrypted)
-    pub fn save_to_disk(&self, path: &std::path::Path) -> Result<()> {
-        let accounts: Vec<Account> = self.list();
-        let json = serde_json::to_string_pretty(&accounts)?;
-        // TODO: encrypt with local machine key before writing
-        std::fs::write(path, json)?;
-        Ok(())
-    }
-
-    /// Load accounts from disk
-    pub fn load_from_disk(&self, path: &std::path::Path) -> Result<usize> {
-        if !path.exists() {
-            return Ok(0);
-        }
-        let data = std::fs::read_to_string(path)?;
-        let accounts: Vec<Account> = serde_json::from_str(&data)?;
-        let count = accounts.len();
-        for acc in accounts {
-            self.accounts.insert(acc.id.clone(), acc);
-        }
-        Ok(count)
-    }
+fn md5_hex(input: &str) -> String {
+    let hash = md5::compute(input.as_bytes());
+    format!("{:x}", hash)
 }

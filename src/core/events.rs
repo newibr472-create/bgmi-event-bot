@@ -1,218 +1,243 @@
-use anyhow::Result;
-use chrono::{DateTime, Duration, Utc};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use super::protocol::{Packet, PacketType};
+use crate::core::account::Account;
+use crate::network::client::BgmiClient;
 
-/// Known event IDs from BGMI decompilation (com.pubg.imobile)
-/// These rotate seasonally but the underlying system stays the same.
-pub mod event_ids {
-    pub const DAILY_LOGIN: u32 = 1001;
-    pub const WEEKLY_PLAYTIME: u32 = 1010;
-    pub const MATCH_COUNT_REWARD: u32 = 1020;
-    pub const POPULARITY_FREE_GIFT: u32 = 2001;
-    pub const POPULARITY_MUTUAL: u32 = 2002;
-    pub const SEASON_PASS_FREE: u32 = 3001;
-    pub const TIME_LIMITED_EVENT: u32 = 4000; // base, actual = 4000 + event_index
-    pub const ACHIEVEMENT_UNLOCK: u32 = 5000;
-    pub const RECALL_EVENT: u32 = 6001;
-    pub const SHARE_REWARD: u32 = 7001;
-}
-
+/// Event types that can be collected - based on BGMI India event system
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GameEvent {
-    pub event_id: u32,
-    pub name: String,
-    pub event_type: EventType,
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
-    pub rewards: Vec<Reward>,
-    pub requirements: Vec<Requirement>,
-    pub claimed: bool,
-    pub progress: f32, // 0.0 - 1.0
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum EventType {
     DailyLogin,
-    TimeBased,       // spend X minutes in match
-    MatchCount,      // play N matches
-    Popularity,      // free popularity exchange
-    Achievement,     // one-time unlock
-    SeasonPass,      // RP rewards
-    TimeLimited,     // rotating events
-    Social,          // share/recall
+    PopularityReward,
+    ExtraReward,
+    SeasonPass,
+    AchievementUnlock,
+    InviteReward,
+    Custom(String),
 }
 
+impl std::fmt::Display for EventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::DailyLogin => write!(f, "daily_login"),
+            Self::PopularityReward => write!(f, "popularity"),
+            Self::ExtraReward => write!(f, "extra_reward"),
+            Self::SeasonPass => write!(f, "season_pass"),
+            Self::AchievementUnlock => write!(f, "achievement"),
+            Self::InviteReward => write!(f, "invite"),
+            Self::Custom(name) => write!(f, "custom:{}", name),
+        }
+    }
+}
+
+/// Result of attempting to collect an event reward
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Reward {
-    pub reward_id: u32,
-    pub item_type: RewardItemType,
-    pub amount: u32,
-    pub name: String,
+pub struct CollectionResult {
+    pub event_type: String,
+    pub success: bool,
+    pub message: String,
+    pub reward_desc: Option<String>,
+    pub timestamp: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum RewardItemType {
-    Silver,          // BP (battle points)
-    UC,              // premium currency (rarely free)
-    Crate,           // supply crate
-    Fragment,        // outfit fragment
-    Popularity,      // popularity points
-    RoomCard,        // room card
-    RP,              // royale pass points
-    Outfit,          // cosmetic
-    Emote,           // emote
-    Coupon,          // discount coupon
+/// Main event collection orchestrator
+pub struct EventCollector {
+    client: BgmiClient,
+    account: Account,
+    results: Vec<CollectionResult>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Requirement {
-    pub req_type: RequirementType,
-    pub target_value: u32,
-    pub current_value: u32,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum RequirementType {
-    MatchesPlayed,
-    MinutesInMatch,
-    DaysLoggedIn,
-    PopularityGiven,
-    KillCount,
-    Top10Finishes,
-    ShareCount,
-}
-
-#[derive(Clone)]
-pub struct EventScheduler {
-    active_events: Arc<RwLock<Vec<GameEvent>>>,
-    claim_queue: Arc<RwLock<Vec<ClaimTask>>>,
-}
-
-#[derive(Debug, Clone)]
-struct ClaimTask {
-    account_id: String,
-    event_id: u32,
-    scheduled_at: DateTime<Utc>,
-}
-
-impl EventScheduler {
-    pub fn new() -> Self {
+impl EventCollector {
+    pub fn new(client: BgmiClient, account: Account) -> Self {
         Self {
-            active_events: Arc::new(RwLock::new(Vec::new())),
-            claim_queue: Arc::new(RwLock::new(Vec::new())),
+            client,
+            account,
+            results: Vec::new(),
         }
     }
 
-    /// Main scheduler loop - checks for claimable events periodically
-    pub async fn run_loop(&self) -> Result<()> {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            self.process_claim_queue().await;
-        }
+    /// Full collection flow: login -> init session -> collect all events
+    pub async fn run_full_collection(&mut self) -> Result<Vec<CollectionResult>> {
+        info!("starting collection for account: {}", self.account.label);
+
+        // Step 1: Login
+        let cred = self.account.credential.to_auth_credential();
+        let guest_id = self.account.guest_id().to_string();
+
+        self.client
+            .login(&cred, &guest_id)
+            .await
+            .context("login failed")?;
+
+        // small delay to mimic human behavior
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        // Step 2: Get ticket
+        self.client
+            .get_ticket(&guest_id)
+            .await
+            .context("get ticket failed")?;
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Step 3: Init pay session (needed for reward claims)
+        self.client
+            .init_pay_session()
+            .await
+            .context("pay session init failed")?;
+
+        // Step 4: Send initial telemetry (anti-detection)
+        let _ = self.client.send_telemetry("sdk_login_success").await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // Step 5: Collect events
+        self.collect_daily_login().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        self.collect_popularity_reward().await;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+        self.collect_extra_rewards().await;
+
+        info!(
+            "collection complete: {} results, {} successful",
+            self.results.len(),
+            self.results.iter().filter(|r| r.success).count()
+        );
+
+        Ok(self.results.clone())
     }
 
-    /// Query active events from server
-    pub fn build_event_list_packet() -> Packet {
-        Packet::new(PacketType::EventList, vec![])
-    }
+    async fn collect_daily_login(&mut self) {
+        debug!("attempting daily login reward");
 
-    /// Parse event list from server response
-    pub fn parse_event_list(payload: &[u8]) -> Result<Vec<GameEvent>> {
-        let events: Vec<GameEvent> = serde_json::from_slice(payload)?;
-        Ok(events)
-    }
-
-    /// Check which events are ready to claim
-    pub async fn get_claimable_events(&self) -> Vec<GameEvent> {
-        let events = self.active_events.read().await;
-        events
-            .iter()
-            .filter(|e| !e.claimed && e.progress >= 1.0 && Utc::now() < e.end_time)
-            .cloned()
-            .collect()
-    }
-
-    /// Build claim request packet for a specific event
-    pub fn build_claim_packet(event_id: u32) -> Packet {
         let payload = serde_json::json!({
-            "event_id": event_id,
-            "timestamp": Utc::now().timestamp(),
+            "cmd": "claim_daily_login",
+            "openid": self.client.openid.as_deref().unwrap_or(""),
+            "zoneid": 1,
+            "plat": 2,
         });
-        Packet::new(
-            PacketType::EventClaimRequest,
-            serde_json::to_vec(&payload).unwrap_or_default(),
-        )
-    }
 
-    /// Build popularity claim packet (free daily gift)
-    pub fn build_popularity_claim(target_open_id: &str) -> Packet {
-        let payload = serde_json::json!({
-            "event_id": event_ids::POPULARITY_FREE_GIFT,
-            "target_open_id": target_open_id,
-            "gift_type": 1, // free type
-            "timestamp": Utc::now().timestamp(),
-        });
-        Packet::new(
-            PacketType::PopularityClaim,
-            serde_json::to_vec(&payload).unwrap_or_default(),
-        )
-    }
+        match self
+            .client
+            .send_pay_command("claim_reward", &payload.to_string())
+            .await
+        {
+            Ok(resp) => {
+                let ret = resp.get("ret").and_then(|v| v.as_i64()).unwrap_or(-1);
+                let msg = resp
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
 
-    /// Schedule a claim for the future (e.g., when time requirement will be met)
-    pub async fn schedule_claim(&self, account_id: &str, event_id: u32, at: DateTime<Utc>) {
-        let mut queue = self.claim_queue.write().await;
-        queue.push(ClaimTask {
-            account_id: account_id.to_string(),
-            event_id,
-            scheduled_at: at,
-        });
-        info!("scheduled claim for event {} at {}", event_id, at);
-    }
-
-    /// Process pending claims that are now due
-    async fn process_claim_queue(&self) {
-        let now = Utc::now();
-        let mut queue = self.claim_queue.write().await;
-
-        let (ready, pending): (Vec<_>, Vec<_>) =
-            queue.drain(..).partition(|t| t.scheduled_at <= now);
-
-        *queue = pending;
-
-        for task in ready {
-            debug!(
-                "executing scheduled claim: event {} for account {}",
-                task.event_id, task.account_id
-            );
-            // the actual send happens through the session associated with the account
-            // this just signals readiness - the session loop picks it up
-        }
-    }
-
-    /// Update local event state from server push
-    pub async fn update_events(&self, events: Vec<GameEvent>) {
-        let mut current = self.active_events.write().await;
-        *current = events;
-    }
-
-    /// Calculate time remaining until a time-based event can be claimed
-    pub fn time_until_claimable(event: &GameEvent) -> Option<Duration> {
-        if event.progress >= 1.0 {
-            return Some(Duration::zero());
-        }
-        // estimate based on progress rate
-        for req in &event.requirements {
-            if req.req_type as u8 == RequirementType::MinutesInMatch as u8 {
-                let remaining_minutes = req.target_value.saturating_sub(req.current_value);
-                return Some(Duration::minutes(remaining_minutes as i64));
+                self.results.push(CollectionResult {
+                    event_type: "daily_login".to_string(),
+                    success: ret == 0,
+                    message: msg.to_string(),
+                    reward_desc: resp.get("reward").and_then(|v| v.as_str()).map(String::from),
+                    timestamp: crate::core::protocol::current_ts_ms(),
+                });
+            }
+            Err(e) => {
+                warn!("daily login collection failed: {}", e);
+                self.results.push(CollectionResult {
+                    event_type: "daily_login".to_string(),
+                    success: false,
+                    message: e.to_string(),
+                    reward_desc: None,
+                    timestamp: crate::core::protocol::current_ts_ms(),
+                });
             }
         }
-        None
+    }
+
+    async fn collect_popularity_reward(&mut self) {
+        debug!("attempting popularity reward");
+
+        let payload = serde_json::json!({
+            "cmd": "claim_popularity",
+            "openid": self.client.openid.as_deref().unwrap_or(""),
+            "zoneid": 1,
+            "plat": 2,
+            "type": "popularity",
+        });
+
+        match self
+            .client
+            .send_pay_command("claim_reward", &payload.to_string())
+            .await
+        {
+            Ok(resp) => {
+                let ret = resp.get("ret").and_then(|v| v.as_i64()).unwrap_or(-1);
+                let msg = resp
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                self.results.push(CollectionResult {
+                    event_type: "popularity".to_string(),
+                    success: ret == 0,
+                    message: msg.to_string(),
+                    reward_desc: resp.get("reward").and_then(|v| v.as_str()).map(String::from),
+                    timestamp: crate::core::protocol::current_ts_ms(),
+                });
+            }
+            Err(e) => {
+                warn!("popularity reward failed: {}", e);
+                self.results.push(CollectionResult {
+                    event_type: "popularity".to_string(),
+                    success: false,
+                    message: e.to_string(),
+                    reward_desc: None,
+                    timestamp: crate::core::protocol::current_ts_ms(),
+                });
+            }
+        }
+    }
+
+    async fn collect_extra_rewards(&mut self) {
+        debug!("attempting extra rewards");
+
+        let payload = serde_json::json!({
+            "cmd": "claim_extra",
+            "openid": self.client.openid.as_deref().unwrap_or(""),
+            "zoneid": 1,
+            "plat": 2,
+            "type": "extra",
+        });
+
+        match self
+            .client
+            .send_pay_command("claim_reward", &payload.to_string())
+            .await
+        {
+            Ok(resp) => {
+                let ret = resp.get("ret").and_then(|v| v.as_i64()).unwrap_or(-1);
+                let msg = resp
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                self.results.push(CollectionResult {
+                    event_type: "extra_reward".to_string(),
+                    success: ret == 0,
+                    message: msg.to_string(),
+                    reward_desc: resp.get("reward").and_then(|v| v.as_str()).map(String::from),
+                    timestamp: crate::core::protocol::current_ts_ms(),
+                });
+            }
+            Err(e) => {
+                warn!("extra reward failed: {}", e);
+                self.results.push(CollectionResult {
+                    event_type: "extra_reward".to_string(),
+                    success: false,
+                    message: e.to_string(),
+                    reward_desc: None,
+                    timestamp: crate::core::protocol::current_ts_ms(),
+                });
+            }
+        }
     }
 }

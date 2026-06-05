@@ -1,140 +1,135 @@
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Key, Nonce,
-};
-use anyhow::{bail, Result};
+use anyhow::{Context, Result};
 use base64::Engine;
-use hmac::{Hmac, Mac};
-use rand::RngCore;
-use sha2::Sha256;
 
-type HmacSha256 = Hmac<Sha256>;
+/// sValidKey generation - reverse engineered from captured traffic.
+/// The SDK sends a different sValidKey per request.
+/// It's an MD5 hash of: sorted(params) + secret
+///
+/// From the APK analysis: libsigner.so handles this but the ITOP SDK
+/// Java code also has a fallback implementation.
+///
+/// Formula: md5(sorted_param_string + sdk_key)
+/// The sdk_key for BGMI India is derived from the offer_id and game_id.
+const SDK_SIGN_KEY: &str = "2dedb362cb224c6e8f22e4c4b2236630";
 
-/// Derived from libhdmpvecore.so analysis - this is the static portion of the key
-/// used to derive per-session encryption keys. The full key is:
-///   SHA256(STATIC_SEED || session_token || timestamp)
-const STATIC_SEED: &[u8] = b"bgmi_packet_k3y_s33d_v2";
+/// Generate sValidKey for SDK API calls
+/// Takes the query params (excluding sValidKey itself) and produces the signature
+pub fn compute_valid_key(params: &[(&str, &str)]) -> String {
+    let mut sorted: Vec<(&str, &str)> = params
+        .iter()
+        .filter(|(k, _)| *k != "sValidKey" && *k != "sRefer")
+        .copied()
+        .collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
-/// Token payload structure after base64 decode:
-/// { "open_id": "...", "token": "...", "ts": unix_ts, "sig": "hmac_hex" }
-/// The sig field is HMAC-SHA256(open_id + token + ts, APP_SECRET)
-const TOKEN_HMAC_KEY: &[u8] = b"com.pubg.imobile.auth.v1";
+    let param_str: String = sorted
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join("&");
 
-pub fn decrypt_token_payload(raw_token: &str) -> Result<serde_json::Value> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(raw_token.trim())
-        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(raw_token.trim()))?;
+    let sign_input = format!("{}{}", param_str, SDK_SIGN_KEY);
+    let hash = md5::compute(sign_input.as_bytes());
+    format!("{:x}", hash)
+}
 
-    let payload: serde_json::Value = serde_json::from_slice(&decoded)?;
+/// Decrypt the encrypt_msg field from min-pay responses
+/// The key_info returned by get_key is used as the AES key
+/// Format: hex-encoded AES-128-ECB encrypted data
+pub fn decrypt_pay_message(encrypted_hex: &str, key_info: &str) -> Result<Vec<u8>> {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    use aes::Aes128;
 
-    // verify signature if present
-    if let Some(sig) = payload.get("sig").and_then(|v| v.as_str()) {
-        let open_id = payload.get("open_id").and_then(|v| v.as_str()).unwrap_or("");
-        let token = payload.get("token").and_then(|v| v.as_str()).unwrap_or("");
-        let ts = payload.get("ts").and_then(|v| v.as_i64()).unwrap_or(0);
+    let encrypted = hex::decode(encrypted_hex).context("invalid hex in encrypted msg")?;
 
-        let msg = format!("{}{}{}", open_id, token, ts);
-        if !verify_hmac(msg.as_bytes(), TOKEN_HMAC_KEY, sig) {
-            bail!("token signature verification failed");
+    // key_info is also hex - first 32 hex chars = 16 bytes for AES-128
+    let key_bytes = hex::decode(&key_info[..32]).context("invalid key_info hex")?;
+
+    let cipher = Aes128::new_from_slice(&key_bytes).context("invalid AES key length")?;
+
+    let mut result = Vec::with_capacity(encrypted.len());
+    for chunk in encrypted.chunks(16) {
+        let mut block = aes::Block::default();
+        block[..chunk.len()].copy_from_slice(chunk);
+        cipher.decrypt_block(&mut block);
+        result.extend_from_slice(&block);
+    }
+
+    // PKCS7 unpad
+    if let Some(&pad_len) = result.last() {
+        let pad_len = pad_len as usize;
+        if pad_len > 0 && pad_len <= 16 {
+            result.truncate(result.len() - pad_len);
         }
     }
 
-    Ok(payload)
+    Ok(result)
 }
 
-/// Derive session encryption key from the session token + current timestamp
-pub fn derive_session_key(session_token: &[u8], timestamp: i64) -> [u8; 32] {
-    use sha2::Digest;
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(STATIC_SEED);
-    hasher.update(session_token);
-    hasher.update(timestamp.to_le_bytes());
-    let result = hasher.finalize();
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&result);
-    key
-}
+/// Encrypt a message for min-pay requests
+pub fn encrypt_pay_message(plaintext: &[u8], key_info: &str) -> Result<String> {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::Aes128;
 
-/// Encrypt packet payload using AES-256-GCM
-/// Format: [nonce: 12 bytes][ciphertext + tag]
-pub fn encrypt_payload(plaintext: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
-    let cipher_key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(cipher_key);
+    let key_bytes = hex::decode(&key_info[..32]).context("invalid key_info hex")?;
+    let cipher = Aes128::new_from_slice(&key_bytes).context("invalid AES key len")?;
 
-    let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    // PKCS7 padding
+    let pad_len = 16 - (plaintext.len() % 16);
+    let mut padded = plaintext.to_vec();
+    padded.extend(std::iter::repeat(pad_len as u8).take(pad_len));
 
-    let ciphertext = cipher
-        .encrypt(nonce, plaintext)
-        .map_err(|e| anyhow::anyhow!("encryption failed: {}", e))?;
-
-    let mut output = Vec::with_capacity(12 + ciphertext.len());
-    output.extend_from_slice(&nonce_bytes);
-    output.extend_from_slice(&ciphertext);
-    Ok(output)
-}
-
-/// Decrypt packet payload (inverse of encrypt_payload)
-pub fn decrypt_payload(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
-    if data.len() < 12 {
-        bail!("ciphertext too short for nonce");
+    let mut result = Vec::with_capacity(padded.len());
+    for chunk in padded.chunks(16) {
+        let mut block = aes::Block::default();
+        block.copy_from_slice(chunk);
+        cipher.encrypt_block(&mut block);
+        result.extend_from_slice(&block);
     }
 
-    let cipher_key = Key::<Aes256Gcm>::from_slice(key);
-    let cipher = Aes256Gcm::new(cipher_key);
-
-    let nonce = Nonce::from_slice(&data[..12]);
-    let ciphertext = &data[12..];
-
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| anyhow::anyhow!("decryption failed: {}", e))?;
-
-    Ok(plaintext)
+    Ok(hex::encode_upper(&result))
 }
 
-/// Compute HMAC-SHA256 for request signing
-pub fn compute_hmac(data: &[u8], key: &[u8]) -> Vec<u8> {
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
+/// Generate xg_mid / session_token (UUID v4 format)
+pub fn gen_session_token() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
-/// Verify an HMAC signature (hex-encoded)
-fn verify_hmac(data: &[u8], key: &[u8], expected_hex: &str) -> bool {
-    let computed = compute_hmac(data, key);
-    let computed_hex = hex_encode(&computed);
-    // constant-time comparison
-    constant_time_eq(computed_hex.as_bytes(), expected_hex.as_bytes())
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/// Parse the sTicket to extract embedded auth data
+/// Format: [random_prefix_bytes][base64_json_payload][suffix_bytes]
+/// The JSON contains: sInnerToken, iOpenid, iGameId, iCTime, sEnv
+pub fn decode_ticket(ticket: &str) -> Option<TicketPayload> {
+    // find the base64 JSON portion - it always starts with encoded "erToken"
+    // which is base64 "ZXJUb2tlbi"
+    let marker = "ZXJ";
+    if let Some(pos) = ticket.find(marker) {
+        let b64_part = &ticket[pos..];
+        // try decoding with various padding
+        for padding in &["", "=", "==", "==="] {
+            let attempt = format!("{}{}", b64_part, padding);
+            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(attempt.as_bytes()) {
+                let text = String::from_utf8_lossy(&decoded);
+                // prepend the "sInn" that was in the encrypted header
+                let full_json = format!("{{\"sInn{}", text.trim_end_matches(|c: char| !c.is_ascii()));
+                if let Ok(payload) = serde_json::from_str::<TicketPayload>(&full_json) {
+                    return Some(payload);
+                }
+            }
+        }
     }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    None
 }
 
-/// Generate device fingerprint to mimic real device auth
-pub fn generate_device_fingerprint() -> String {
-    use sha2::Digest;
-    let mut rng = rand::thread_rng();
-    let mut random_bytes = [0u8; 32];
-    rng.fill_bytes(&mut random_bytes);
-
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(b"android_");
-    hasher.update(&random_bytes);
-    let hash = hasher.finalize();
-    hex_encode(&hash[..16])
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TicketPayload {
+    #[serde(rename = "sInnerToken")]
+    pub inner_token: Option<String>,
+    #[serde(rename = "iOpenid")]
+    pub openid: Option<u64>,
+    #[serde(rename = "iGameId")]
+    pub game_id: Option<u32>,
+    #[serde(rename = "iCTime")]
+    pub create_time: Option<u64>,
+    #[serde(rename = "sEnv")]
+    pub env: Option<String>,
 }

@@ -1,244 +1,190 @@
-use anyhow::{Context, Result};
-use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio::time::{interval, Instant};
-use tracing::{debug, error, info, warn};
+use anyhow::Result;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tokio::time::{interval, Duration};
+use tracing::{error, warn};
 
-use super::account::Account;
-use super::protocol::{Packet, PacketType};
-use crate::network::client::GameClient;
+use crate::core::account::{Account, AccountStatus};
+use crate::core::events::{CollectionResult, EventCollector};
+use crate::network::client::BgmiClient;
 
-const HEARTBEAT_INTERVAL_SEC: u64 = 15;
-const SESSION_TIMEOUT_SEC: u64 = 300;
-const RECONNECT_DELAY_MS: u64 = 3000;
-const MAX_RECONNECT_ATTEMPTS: u32 = 5;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum SessionState {
-    Disconnected,
-    Connecting,
-    Authenticating,
-    Lobby,
-    InMatch,
-    Error(String),
+/// Manages the lifecycle of a single account session.
+/// Handles periodic collection, cooldowns, and retry logic.
+pub struct SessionManager {
+    accounts: Arc<RwLock<Vec<Account>>>,
+    results: Arc<RwLock<Vec<(String, CollectionResult)>>>,
+    running: Arc<RwLock<bool>>,
 }
 
-pub struct GameSession {
-    account: Account,
-    state: SessionState,
-    client: Option<GameClient>,
-    session_token: Option<Vec<u8>>,
-    last_heartbeat: Instant,
-    reconnect_count: u32,
-    shutdown_rx: mpsc::Receiver<()>,
-}
-
-impl GameSession {
-    pub fn new(account: Account, shutdown_rx: mpsc::Receiver<()>) -> Self {
+impl SessionManager {
+    pub fn new() -> Self {
         Self {
-            account,
-            state: SessionState::Disconnected,
-            client: None,
-            session_token: None,
-            last_heartbeat: Instant::now(),
-            reconnect_count: 0,
-            shutdown_rx,
+            accounts: Arc::new(RwLock::new(Vec::new())),
+            results: Arc::new(RwLock::new(Vec::new())),
+            running: Arc::new(RwLock::new(false)),
         }
     }
 
-    pub async fn connect(&mut self) -> Result<()> {
-        self.state = SessionState::Connecting;
-        info!(
-            "connecting account {} to {}",
-            self.account.display_name,
-            self.account.region.gateway_host()
-        );
-
-        let client = GameClient::connect(
-            self.account.region.gateway_host(),
-            self.account.region.gateway_port(),
-        )
-        .await
-        .context("failed to connect to gateway")?;
-
-        self.client = Some(client);
-        self.state = SessionState::Authenticating;
-
-        self.authenticate().await?;
-        self.state = SessionState::Lobby;
-        self.reconnect_count = 0;
-
-        info!("session established for {}", self.account.display_name);
-        Ok(())
+    pub async fn add_account(&self, account: Account) {
+        self.accounts.write().await.push(account);
     }
 
-    async fn authenticate(&mut self) -> Result<()> {
-        let client = self.client.as_mut().unwrap();
+    pub async fn remove_account(&self, id: &str) -> bool {
+        let mut accounts = self.accounts.write().await;
+        if let Some(pos) = accounts.iter().position(|a| a.id == id) {
+            accounts.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
 
-        // build login packet
-        let login_payload = serde_json::json!({
-            "open_id": self.account.open_id,
-            "token": self.account.auth_token,
-            "client_version": "2.9.0",
-            "os": "android",
-            "device_id": uuid::Uuid::new_v4().to_string(),
-        });
+    pub async fn get_accounts(&self) -> Vec<Account> {
+        self.accounts.read().await.clone()
+    }
 
-        let login_packet = Packet::new(
-            PacketType::LoginRequest,
-            serde_json::to_vec(&login_payload)?,
-        );
+    pub async fn get_results(&self) -> Vec<(String, CollectionResult)> {
+        self.results.read().await.clone()
+    }
 
-        client.send_packet(&login_packet).await?;
+    /// Run collection for a single account
+    pub async fn collect_for_account(&self, account_id: &str) -> Result<Vec<CollectionResult>> {
+        let account = {
+            let accounts = self.accounts.read().await;
+            accounts
+                .iter()
+                .find(|a| a.id == account_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("account not found"))?
+        };
 
-        // wait for auth response
-        let response = client
-            .recv_packet()
-            .await
-            .context("no response to login")?;
+        // update status
+        self.update_account_status(&account.id, AccountStatus::Collecting)
+            .await;
 
-        match response.packet_type {
-            PacketType::LoginResponse => {
-                let body: serde_json::Value = serde_json::from_slice(&response.payload)?;
-                let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-                if code != 0 {
-                    let msg = body
-                        .get("msg")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown error");
-                    anyhow::bail!("login failed ({}): {}", code, msg);
+        let client = BgmiClient::new(
+            &account.device.device_id,
+            &account.device.model,
+            &account.device.brand,
+        )?;
+
+        let mut collector = EventCollector::new(client, account.clone());
+
+        match collector.run_full_collection().await {
+            Ok(results) => {
+                // store results
+                let mut all_results = self.results.write().await;
+                for r in &results {
+                    all_results.push((account.id.clone(), r.clone()));
                 }
-                // extract session token
-                if let Some(tok) = body.get("session_token").and_then(|v| v.as_str()) {
-                    self.session_token = Some(base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        tok,
-                    )?);
-                }
-                Ok(())
+
+                self.update_account_status(&account.id, AccountStatus::Cooldown)
+                    .await;
+                Ok(results)
             }
-            PacketType::ErrorResponse => {
-                anyhow::bail!("server rejected login");
-            }
-            _ => {
-                anyhow::bail!("unexpected response type: {:?}", response.packet_type);
+            Err(e) => {
+                error!("collection failed for {}: {}", account.label, e);
+                self.update_account_status(&account.id, AccountStatus::Error)
+                    .await;
+                Err(e)
             }
         }
     }
 
-    pub async fn run_loop(&mut self) -> Result<()> {
-        self.connect().await?;
-        let mut heartbeat_tick = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SEC));
+    /// Run collection for all accounts sequentially with delays
+    pub async fn collect_all(&self) -> Vec<(String, Vec<CollectionResult>)> {
+        let accounts = self.accounts.read().await.clone();
+        let mut all_results = Vec::new();
 
-        loop {
-            // Try non-blocking recv on shutdown channel first
-            match self.shutdown_rx.try_recv() {
-                Ok(()) => {
-                    info!("session shutdown requested");
-                    break;
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    info!("shutdown channel closed");
-                    break;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {}
+        for account in &accounts {
+            if account.status == AccountStatus::Banned {
+                continue;
             }
 
-            tokio::select! {
-                _ = heartbeat_tick.tick() => {
-                    if let Err(e) = self.send_heartbeat().await {
-                        warn!("heartbeat failed: {}", e);
-                        if let Err(re) = self.try_reconnect().await {
-                            error!("reconnect failed: {}", re);
-                            break;
-                        }
+            match self.collect_for_account(&account.id).await {
+                Ok(results) => {
+                    all_results.push((account.id.clone(), results));
+                }
+                Err(e) => {
+                    warn!("skipping account {}: {}", account.label, e);
+                }
+            }
+
+            // delay between accounts to avoid rate limiting
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+
+        all_results
+    }
+
+    /// Start periodic collection loop
+    pub async fn start_periodic(&self, interval_mins: u64) {
+        let mut running = self.running.write().await;
+        if *running {
+            return;
+        }
+        *running = true;
+        drop(running);
+
+        let accounts = self.accounts.clone();
+        let results = self.results.clone();
+        let running = self.running.clone();
+
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(interval_mins * 60));
+
+            loop {
+                ticker.tick().await;
+
+                if !*running.read().await {
+                    break;
+                }
+
+                let accs = accounts.read().await.clone();
+                for account in &accs {
+                    if account.status == AccountStatus::Banned {
+                        continue;
                     }
-                }
-                packet = self.recv_next() => {
-                    match packet {
-                        Ok(Some(pkt)) => self.handle_packet(pkt).await,
-                        Ok(None) => {
-                            debug!("connection closed by server");
-                            if let Err(e) = self.try_reconnect().await {
-                                error!("reconnect failed: {}", e);
-                                break;
+
+                    let client = match BgmiClient::new(
+                        &account.device.device_id,
+                        &account.device.model,
+                        &account.device.brand,
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            error!("failed to create client: {}", e);
+                            continue;
+                        }
+                    };
+
+                    let mut collector = EventCollector::new(client, account.clone());
+                    match collector.run_full_collection().await {
+                        Ok(res) => {
+                            let mut all = results.write().await;
+                            for r in res {
+                                all.push((account.id.clone(), r));
                             }
                         }
                         Err(e) => {
-                            warn!("recv error: {}", e);
+                            warn!("periodic collection failed for {}: {}", account.label, e);
                         }
                     }
+
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
+        });
+    }
+
+    pub async fn stop_periodic(&self) {
+        *self.running.write().await = false;
+    }
+
+    async fn update_account_status(&self, id: &str, status: AccountStatus) {
+        let mut accounts = self.accounts.write().await;
+        if let Some(acc) = accounts.iter_mut().find(|a| a.id == id) {
+            acc.status = status;
         }
-
-        self.disconnect().await;
-        Ok(())
-    }
-
-    async fn send_heartbeat(&mut self) -> Result<()> {
-        let client = self.client.as_mut().ok_or_else(|| anyhow::anyhow!("no client"))?;
-        let hb = Packet::new(PacketType::Heartbeat, vec![]);
-        client.send_packet(&hb).await?;
-        self.last_heartbeat = Instant::now();
-        Ok(())
-    }
-
-    async fn recv_next(&mut self) -> Result<Option<Packet>> {
-        let client = self.client.as_mut().ok_or_else(|| anyhow::anyhow!("no client"))?;
-        client.recv_packet_timeout(Duration::from_secs(HEARTBEAT_INTERVAL_SEC)).await
-    }
-
-    async fn handle_packet(&mut self, packet: Packet) {
-        match packet.packet_type {
-            PacketType::HeartbeatAck => {
-                debug!("heartbeat ack");
-            }
-            PacketType::EventNotification => {
-                if let Ok(data) = serde_json::from_slice::<serde_json::Value>(&packet.payload) {
-                    info!("event notification: {:?}", data);
-                }
-            }
-            PacketType::RewardGrant => {
-                if let Ok(data) = serde_json::from_slice::<serde_json::Value>(&packet.payload) {
-                    info!("reward granted: {:?}", data);
-                }
-            }
-            PacketType::KickNotice => {
-                warn!("kicked from server");
-                self.state = SessionState::Disconnected;
-            }
-            _ => {
-                debug!("unhandled packet type: {:?}", packet.packet_type);
-            }
-        }
-    }
-
-    async fn try_reconnect(&mut self) -> Result<()> {
-        if self.reconnect_count >= MAX_RECONNECT_ATTEMPTS {
-            anyhow::bail!("max reconnect attempts reached");
-        }
-        self.reconnect_count += 1;
-        warn!(
-            "reconnecting (attempt {}/{})",
-            self.reconnect_count, MAX_RECONNECT_ATTEMPTS
-        );
-        tokio::time::sleep(Duration::from_millis(RECONNECT_DELAY_MS)).await;
-        self.connect().await
-    }
-
-    async fn disconnect(&mut self) {
-        if let Some(ref mut client) = self.client {
-            let _ = client
-                .send_packet(&Packet::new(PacketType::Disconnect, vec![]))
-                .await;
-            client.close().await;
-        }
-        self.client = None;
-        self.state = SessionState::Disconnected;
-    }
-
-    pub fn state(&self) -> &SessionState {
-        &self.state
     }
 }

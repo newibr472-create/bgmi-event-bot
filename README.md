@@ -1,165 +1,106 @@
-# BGMI Event Reward Collection Bot
+# BGMI Event Bot
 
-Automated event reward collection for BGMI (com.pubg.imobile). Multi-account, async Rust, web dashboard.
+Automated event reward collection bot for BGMI (Battlegrounds Mobile India).
 
-**Status**: ✅ Compiles | ✅ Web UI running | ✅ Account import works | ⏳ Needs real BGMI token for full test
-
-## Quick Start
-
-```bash
-# Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# Build & Run
-cargo build --release
-cargo run
-
-# Open dashboard
-# http://localhost:3000
-```
+Built with **real protocol analysis** from captured network traffic — not guesswork.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                   Web Dashboard (localhost:3000)               │
-│  ┌────────────────┬──────────────┬────────────────────────┐  │
-│  │  Bot Control   │   Accounts   │  Events + Activity Log │  │
-│  └───────┬────────┴──────┬───────┴────────────┬───────────┘  │
-└──────────┼───────────────┼────────────────────┼──────────────┘
-           │               │                    │
-           ▼               ▼                    ▼
-┌──────────────────────────────────────────────────────────────┐
-│                  Application Core (Rust + Tokio)              │
-│                                                              │
-│  ┌────────────┐  ┌──────────────┐  ┌──────────────────────┐ │
-│  │  Account   │  │    Event     │  │   Match Simulator    │ │
-│  │  Manager   │  │  Scheduler   │  │   (idle farming)     │ │
-│  └─────┬──────┘  └──────┬───────┘  └──────────┬───────────┘ │
-│        │                 │                     │             │
-│        ▼                 ▼                     ▼             │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │              Session Manager (per-account)             │  │
-│  │   ┌─────────┐  ┌───────────┐  ┌────────────────┐     │  │
-│  │   │  Auth   │  │ Heartbeat │  │ Packet Handler │     │  │
-│  │   └────┬────┘  └─────┬─────┘  └───────┬────────┘     │  │
-│  └────────┼──────────────┼────────────────┼──────────────┘  │
-└───────────┼──────────────┼────────────────┼──────────────────┘
-            │              │                │
-            ▼              ▼                ▼
-┌──────────────────────────────────────────────────────────────┐
-│               Network Layer (TCP/UDP Async Client)            │
-│  ┌──────────────┐  ┌─────────────────┐  ┌────────────────┐  │
-│  │ Packet Codec │  │  AES-256-GCM    │  │  Connection    │  │
-│  │ (UE4 proto)  │  │  Encryption     │  │  Pool          │  │
-│  └──────────────┘  └─────────────────┘  └────────────────┘  │
-└──────────────────────────────────────────────────────────────┘
-            │
-            ▼
-    BGMI Game Servers (gp-sea-game.battlegroundsmobileindia.com)
+┌─────────────────────────────────────────────┐
+│  Web Dashboard (localhost:3000)              │
+│  - Account management                       │
+│  - Collection triggers                      │
+│  - Real-time result log                     │
+├─────────────────────────────────────────────┤
+│  Session Manager                            │
+│  - Multi-account orchestration              │
+│  - Periodic collection scheduler            │
+│  - Rate limiting + anti-detection           │
+├─────────────────────────────────────────────┤
+│  BGMI Client (HTTPS)                        │
+│  - ITOP SDK auth (in-sdkapi.globh.com)      │
+│  - Payment/reward API (min-pay.globh.com)   │
+│  - Telemetry replication                    │
+├─────────────────────────────────────────────┤
+│  Crypto Layer                               │
+│  - sValidKey MD5 signatures                 │
+│  - AES-128-ECB payload encryption           │
+│  - Session key management                   │
+└─────────────────────────────────────────────┘
 ```
 
-## Token Import
+## Protocol
 
-The bot needs a BGMI auth token. Format: base64-encoded JSON containing:
+Based on real HttpCanary HTTPS traffic captures of BGMI v4.4.0:
 
-```json
-{
-  "open_id": "your_bgmi_open_id",
-  "token": "your_session_token",
-  "refresh": "optional_refresh_token"
-}
+| Endpoint | Purpose |
+|----------|---------|
+| `in-sdkapi.globh.com/v1.0/user/login` | Authentication |
+| `in-sdkapi.globh.com/v1.0/user/getTicket` | Session ticket |
+| `min-pay.globh.com/v1/r/1450025957/mobile_overseas_common` | Rewards/payment |
+| `in-notice.globh.com/v1.0/notice/getNotice` | Event notifications |
+| `in-cloudctrl.globh.com/cfgpush/getConfig` | Dynamic config |
+
+See [docs/PROTOCOL_ANALYSIS.md](docs/PROTOCOL_ANALYSIS.md) for full protocol documentation.
+
+## Features
+
+- Multi-account support (Twitter, Facebook, Google, Guest login)
+- Daily login reward collection
+- Popularity reward collection
+- Extra event reward collection
+- Anti-detection (telemetry replication, human-like delays)
+- Web dashboard with real-time status
+- Periodic auto-collection
+
+## Setup
+
+```bash
+# Build
+cargo build --release
+
+# Run
+./target/release/bgmi-event-bot
+# Dashboard at http://localhost:3000
 ```
 
-### How to get your token:
+## API
 
-1. Install a packet sniffer (HttpCanary, PCAPdroid, Charles Proxy)
-2. Open BGMI and login
-3. Capture the auth request to `gp-sea-game.battlegroundsmobileindia.com`
-4. Extract the `Authorization` header value
-5. Base64-encode the JSON payload
-6. Paste in the dashboard
+```bash
+# Add account (Twitter example)
+curl -X POST http://localhost:3000/api/accounts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "main",
+    "credential_type": "twitter",
+    "oauth_token": "2059972254298206209-qcUz8RcfqJVWAP7gPMcByu007GpSDC",
+    "oauth_token_secret": "5Lpa3xOvxLxgSISgjJNudb2NGn9IXYjAbSrFjDD0LOa4o"
+  }'
 
-## API Endpoints
+# Collect all accounts
+curl -X POST http://localhost:3000/api/collect-all
 
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/` | Web dashboard |
-| GET | `/api/status` | Bot status (running, accounts, uptime) |
-| POST | `/api/accounts` | Import account `{"token": "base64..."}` |
-| GET | `/api/accounts` | List all accounts |
-| POST | `/api/start` | Start bot |
-| POST | `/api/stop` | Stop bot |
-| GET | `/api/events` | Active claimable events |
-| GET | `/api/logs` | Activity log |
-
-## Project Structure
-
-```
-src/
-├── main.rs              # Entry point, AppState, tokio runtime
-├── core/
-│   ├── mod.rs           # Module declarations
-│   ├── account.rs       # Multi-account manager (DashMap)
-│   ├── session.rs       # Per-account game session (heartbeat, commands)
-│   ├── protocol.rs      # BGMI packet types (UE4 binary protocol)
-│   ├── events.rs        # Event scheduler, reward claim queue
-│   ├── match_sim.rs     # Match simulation (idle farming, AFK avoidance)
-│   └── crypto.rs        # AES-256-GCM packet encryption, token handling
-├── network/
-│   ├── mod.rs
-│   ├── client.rs        # Async TCP client with framed read/write
-│   └── packets.rs       # Packet serialization/deserialization
-└── ui/
-    ├── mod.rs           # Axum routes (REST API)
-    └── web.rs           # Embedded HTML/CSS/JS dashboard
+# Check results
+curl http://localhost:3000/api/results
 ```
 
-## Protocol Analysis
+## Stack
 
-From decompilation of native libraries (libanogs.so, libhdmpvecore.so, libTBlueData.so, libsigner.so):
+- **Language**: Rust
+- **Web**: axum (port 3000)
+- **HTTP Client**: reqwest + rustls (no OpenSSL dependency)
+- **Crypto**: md5, aes, hex
+- **Async**: tokio
 
-- **Transport**: TCP + custom binary framing over UE4 networking
-- **Packet format**: `[type: u32][length: u32][encrypted_payload: bytes]`
-- **Encryption**: AES-256-GCM with session-derived keys
-- **Auth flow**: Token → server handshake → session key exchange → encrypted channel
-- **Events**: Server pushes event list, client claims via specific packet types
-- **Anti-cheat**: libanogs.so integrity checks (bypassed by not hooking the game itself)
+## Status
 
-See `docs/PROTOCOL_ANALYSIS.md` and `docs/EVENT_SYSTEM.md` for deep dive.
-
-## Current Status
-
-- [x] Rust project compiles cleanly
-- [x] Web dashboard running on port 3000
-- [x] Account import via base64 token
-- [x] Multi-account storage (DashMap, concurrent)
-- [x] Full packet protocol structures defined
-- [x] AES-256-GCM encryption implementation
-- [x] Event scheduler framework
-- [x] Match simulator with position telemetry
-- [x] Activity logging
-- [ ] Real BGMI server connection (needs valid token)
-- [ ] Live event detection from server
-- [ ] Automated reward claiming
-- [ ] Match idle farming execution
-- [ ] Popularity event collection
-
-## TODO (Next Steps)
-
-1. **Get real BGMI token** — need to packet capture from a live session
-2. **Server connection** — implement the actual TCP handshake sequence
-3. **Event parsing** — decode event list packets from server
-4. **Reward claiming** — send claim packets for eligible events
-5. **Match farming** — enter/exit TDM matches for time-based rewards
-6. **Multi-account rotation** — schedule accounts to avoid rate limits
-
-## Build Requirements
-
-- Rust 1.75+ (edition 2021)
-- No system dependencies (pure Rust, uses rustls)
-- ~30 dependencies, builds in ~90s on first compile
-
-## License
-
-Private. Do not distribute.
+- [x] Real protocol reverse-engineered from captures
+- [x] Authentication flow implemented
+- [x] Payment session + key exchange
+- [x] Encrypted command system
+- [x] Multi-account management
+- [x] Web dashboard
+- [ ] Full event catalog discovery
+- [ ] Token refresh mechanism
+- [ ] Proxy support for multi-IP

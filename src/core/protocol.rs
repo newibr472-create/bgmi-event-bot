@@ -1,191 +1,214 @@
-use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// BGMI uses a custom binary protocol over TCP layered on UE4 networking.
-/// Each packet: [type: u32][length: u32][payload: N bytes]
-/// Payload is AES-GCM encrypted after the handshake phase.
+/// Real BGMI ITOP SDK API protocol - extracted from HttpCanary captures.
+/// Auth uses HTTPS REST calls to globh.com infrastructure, NOT raw TCP/UDP.
+/// The game uses UDP (port 9030/9031) only for the realtime match protocol.
+/// Events/rewards go through min-pay.globh.com HTTPS + encrypted messages.
 
-pub const PACKET_HEADER_SIZE: usize = 8;
-pub const MAX_PACKET_SIZE: usize = 1024 * 64; // 64KB max
+pub const SDK_VERSION: &str = "2.10.3";
+pub const GAME_VERSION: &str = "4.4.0";
+pub const GAME_ID: u32 = 1450;
+pub const OFFER_ID: &str = "1450025957";
+pub const PLATFORM: u32 = 2; // android
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u32)]
-pub enum PacketType {
-    // Auth flow
-    LoginRequest = 0x0001,
-    LoginResponse = 0x0002,
-    TokenRefresh = 0x0003,
-    TokenRefreshAck = 0x0004,
+// API hosts from real captures
+pub const HOST_SDK_API: &str = "in-sdkapi.globh.com";
+pub const HOST_NOTICE: &str = "in-notice.globh.com";
+pub const HOST_PAY: &str = "min-pay.globh.com";
+pub const HOST_CLOUD_CTRL: &str = "in-cloudctrl.globh.com";
+pub const HOST_VOICE_CFG: &str = "in-voiceconfig.globh.com";
 
-    // Session management
-    Heartbeat = 0x0010,
-    HeartbeatAck = 0x0011,
-    Disconnect = 0x0012,
-    KickNotice = 0x0013,
-
-    // Lobby
-    LobbyState = 0x0020,
-    PlayerInfo = 0x0021,
-    FriendList = 0x0022,
-
-    // Match lifecycle
-    MatchJoinRequest = 0x0030,
-    MatchJoinResponse = 0x0031,
-    MatchStart = 0x0032,
-    MatchUpdate = 0x0033,
-    MatchEnd = 0x0034,
-    MatchLeave = 0x0035,
-
-    // Events and rewards
-    EventList = 0x0040,
-    EventDetail = 0x0041,
-    EventClaimRequest = 0x0042,
-    EventClaimResponse = 0x0043,
-    EventNotification = 0x0044,
-    RewardGrant = 0x0045,
-
-    // Popularity/social
-    PopularityQuery = 0x0050,
-    PopularityClaim = 0x0051,
-    PopularityResult = 0x0052,
-
-    // Telemetry (client -> server)
-    TelemetryReport = 0x0060,
-    TelemetryAck = 0x0061,
-
-    // Error
-    ErrorResponse = 0xFF00,
-
-    Unknown = 0xFFFF,
+/// dinfo format from captures: "1|40455|<model>|<lang>|<version>|<timestamp>|<density>|<resolution>|<brand>"
+pub fn build_dinfo(model: &str, brand: &str, timestamp: u64) -> String {
+    format!(
+        "1|40455|{}|en|{}|{}|2.625|2400*1080|{}",
+        model, GAME_VERSION, timestamp, brand
+    )
 }
 
-impl From<u32> for PacketType {
-    fn from(v: u32) -> Self {
-        match v {
-            0x0001 => Self::LoginRequest,
-            0x0002 => Self::LoginResponse,
-            0x0003 => Self::TokenRefresh,
-            0x0004 => Self::TokenRefreshAck,
-            0x0010 => Self::Heartbeat,
-            0x0011 => Self::HeartbeatAck,
-            0x0012 => Self::Disconnect,
-            0x0013 => Self::KickNotice,
-            0x0020 => Self::LobbyState,
-            0x0021 => Self::PlayerInfo,
-            0x0022 => Self::FriendList,
-            0x0030 => Self::MatchJoinRequest,
-            0x0031 => Self::MatchJoinResponse,
-            0x0032 => Self::MatchStart,
-            0x0033 => Self::MatchUpdate,
-            0x0034 => Self::MatchEnd,
-            0x0035 => Self::MatchLeave,
-            0x0040 => Self::EventList,
-            0x0041 => Self::EventDetail,
-            0x0042 => Self::EventClaimRequest,
-            0x0043 => Self::EventClaimResponse,
-            0x0044 => Self::EventNotification,
-            0x0045 => Self::RewardGrant,
-            0x0050 => Self::PopularityQuery,
-            0x0051 => Self::PopularityClaim,
-            0x0052 => Self::PopularityResult,
-            0x0060 => Self::TelemetryReport,
-            0x0061 => Self::TelemetryAck,
-            0xFF00 => Self::ErrorResponse,
-            _ => Self::Unknown,
-        }
-    }
+/// pf (platform fingerprint) for payment calls
+pub fn build_pf(openid: &str) -> String {
+    format!(
+        "IEG_iTOP-2001-android-2011-TW-{}-{}-igame",
+        GAME_ID, openid
+    )
 }
 
-#[derive(Debug, Clone)]
-pub struct Packet {
-    pub packet_type: PacketType,
-    pub payload: Vec<u8>,
+pub fn current_ts_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
-impl Packet {
-    pub fn new(packet_type: PacketType, payload: Vec<u8>) -> Self {
-        Self {
-            packet_type,
-            payload,
-        }
-    }
-
-    pub fn encode(&self) -> BytesMut {
-        let mut buf = BytesMut::with_capacity(PACKET_HEADER_SIZE + self.payload.len());
-        buf.put_u32(self.packet_type as u32);
-        buf.put_u32(self.payload.len() as u32);
-        buf.put_slice(&self.payload);
-        buf
-    }
-
-    pub fn decode(buf: &mut BytesMut) -> Result<Option<Self>, ProtocolError> {
-        if buf.len() < PACKET_HEADER_SIZE {
-            return Ok(None); // need more data
-        }
-
-        let ptype = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let length = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-
-        if length > MAX_PACKET_SIZE {
-            return Err(ProtocolError::PacketTooLarge(length));
-        }
-
-        if buf.len() < PACKET_HEADER_SIZE + length {
-            return Ok(None); // incomplete
-        }
-
-        buf.advance(PACKET_HEADER_SIZE);
-        let payload = buf.split_to(length).to_vec();
-
-        Ok(Some(Packet {
-            packet_type: PacketType::from(ptype),
-            payload,
-        }))
-    }
-
-    pub fn is_encrypted(&self) -> bool {
-        // packets after auth are encrypted; auth packets are plaintext
-        !matches!(
-            self.packet_type,
-            PacketType::LoginRequest | PacketType::LoginResponse | PacketType::ErrorResponse
-        )
-    }
-}
-
-/// Match-related data structures extracted from UE4 protocol analysis
+/// Login response from in-sdkapi.globh.com/v1.0/user/login
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MatchConfig {
-    pub map_id: u32,
-    pub mode: MatchMode,
-    pub perspective: Perspective,
-    pub max_players: u32,
-    pub bot_fill: bool,
+pub struct LoginResponse {
+    pub code: i32,
+    pub desc: String,
+    #[serde(rename = "iOpenid")]
+    pub openid: String,
+    #[serde(rename = "sInnerToken")]
+    pub inner_token: String,
+    #[serde(rename = "iGuid")]
+    pub guid: String,
+    #[serde(rename = "iChannel")]
+    pub channel: u32,
+    #[serde(rename = "iGameId")]
+    pub game_id: u32,
+    #[serde(rename = "sChannelId")]
+    pub channel_id: String,
+    #[serde(rename = "iExpireTime")]
+    pub expire_time: u64,
+    #[serde(rename = "sUserName")]
+    pub username: String,
+    #[serde(rename = "sBirthdate")]
+    pub birthdate: String,
+    #[serde(rename = "iGender")]
+    pub gender: u32,
+    #[serde(rename = "sPictureUrl")]
+    pub picture_url: String,
+    #[serde(rename = "firstLoginTag")]
+    pub first_login_tag: u32,
+    #[serde(rename = "retExtraJson")]
+    pub extra_json: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum MatchMode {
-    Classic,
-    Arcade,
-    EvoGround,
-    Arena,
-    TDM,
+/// Ticket response from in-sdkapi.globh.com/v1.0/user/getTicket
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TicketResponse {
+    pub code: i32,
+    pub desc: String,
+    #[serde(rename = "sTicket")]
+    pub ticket: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum Perspective {
-    TPP,
-    FPP,
+/// Bind relation response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindRelationResponse {
+    pub code: i32,
+    pub desc: String,
+    #[serde(rename = "iOpenid")]
+    pub openid: Option<String>,
+    #[serde(rename = "sInnerToken")]
+    pub inner_token: Option<String>,
+    #[serde(rename = "iGuid")]
+    pub guid: Option<String>,
+    #[serde(rename = "ARelationInfo")]
+    pub relations: Option<Vec<RelationInfo>>,
 }
 
-#[derive(Error, Debug)]
-pub enum ProtocolError {
-    #[error("packet exceeds max size: {0} bytes")]
-    PacketTooLarge(usize),
-    #[error("invalid packet type: {0:#x}")]
-    InvalidType(u32),
-    #[error("decryption failed: {0}")]
-    DecryptionFailed(String),
-    #[error("malformed payload")]
-    MalformedPayload,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationInfo {
+    #[serde(rename = "iChannel")]
+    pub channel: u32,
+    #[serde(rename = "sUserName")]
+    pub username: String,
+    #[serde(rename = "sPictureUrl")]
+    pub picture_url: String,
+    #[serde(rename = "iGender")]
+    pub gender: u32,
+    #[serde(rename = "iBindTime")]
+    pub bind_time: String,
+    #[serde(rename = "sChannelId")]
+    pub channel_id: String,
+}
+
+/// Notice response from in-notice.globh.com
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoticeResponse {
+    pub code: i32,
+    pub desc: String,
+    #[serde(rename = "noticeNum")]
+    pub notice_num: u32,
+    #[serde(rename = "noticelist")]
+    pub notice_list: Vec<serde_json::Value>,
+}
+
+/// Payment/reward session init response from min-pay.globh.com
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaySessionResponse {
+    pub ret: i32,
+    pub get_ip: Option<GetIpResult>,
+    pub get_key: Option<GetKeyResult>,
+    pub info: Option<serde_json::Value>,
+    pub order: Option<serde_json::Value>,
+    pub provide: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetIpResult {
+    pub ret: i32,
+    pub info: Vec<IpInfo>,
+    pub unipay_host: Option<String>,
+    pub h5_host: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpInfo {
+    pub ip: String,
+    pub province: String,
+    pub cat: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetKeyResult {
+    pub ret: i32,
+    pub key_info: String,
+    pub key_info_len: String,
+    pub user_info: UserKeyInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserKeyInfo {
+    pub uin: String,
+    pub uin_type: String,
+    pub uin_len: u32,
+    pub codeindex: u32,
+}
+
+/// CloudCtrl config response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudCtrlResponse {
+    pub ret: i32,
+    pub next_gap: u32,
+    pub biz_data: Option<serde_json::Value>,
+}
+
+/// Channel constants (from captured iChannel values)
+pub mod channels {
+    pub const TWITTER: u32 = 35;
+    pub const FACEBOOK: u32 = 28;
+    pub const GOOGLE: u32 = 4;
+    pub const GUEST: u32 = 99;
+}
+
+/// Authentication credential types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuthCredential {
+    Twitter {
+        oauth_token: String,
+        oauth_token_secret: String,
+    },
+    Facebook {
+        access_token: String,
+    },
+    Google {
+        id_token: String,
+    },
+    Guest {
+        guest_id: String,
+    },
+}
+
+impl AuthCredential {
+    pub fn channel(&self) -> u32 {
+        match self {
+            Self::Twitter { .. } => channels::TWITTER,
+            Self::Facebook { .. } => channels::FACEBOOK,
+            Self::Google { .. } => channels::GOOGLE,
+            Self::Guest { .. } => channels::GUEST,
+        }
+    }
 }

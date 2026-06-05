@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BGMI Event Bot</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0f; color: #e0e0e0; min-height: 100vh; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        header { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; border-bottom: 1px solid #1a1a2e; margin-bottom: 30px; }
+        h1 { font-size: 1.5em; color: #00ff88; }
+        .badge { background: #1a2e1a; color: #00ff88; padding: 4px 12px; border-radius: 12px; font-size: 0.75em; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .card { background: #12121a; border: 1px solid #1a1a2e; border-radius: 12px; padding: 20px; }
+        .card h2 { font-size: 1.1em; margin-bottom: 15px; color: #a0a0b0; }
+        .form-group { margin-bottom: 12px; }
+        .form-group label { display: block; font-size: 0.85em; color: #707080; margin-bottom: 4px; }
+        .form-group input, .form-group select { width: 100%; padding: 8px 12px; background: #0a0a12; border: 1px solid #2a2a3e; border-radius: 6px; color: #e0e0e0; font-size: 0.9em; }
+        .form-group input:focus, .form-group select:focus { outline: none; border-color: #00ff88; }
+        .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85em; font-weight: 500; transition: all 0.2s; }
+        .btn-primary { background: #00ff88; color: #000; }
+        .btn-primary:hover { background: #00cc6e; }
+        .btn-danger { background: #ff4444; color: #fff; }
+        .btn-danger:hover { background: #cc3333; }
+        .btn-secondary { background: #2a2a3e; color: #e0e0e0; }
+        .btn-secondary:hover { background: #3a3a4e; }
+        .account-list { list-style: none; }
+        .account-item { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #1a1a2e; }
+        .account-item:last-child { border-bottom: none; }
+        .account-info { display: flex; flex-direction: column; gap: 2px; }
+        .account-label { font-weight: 500; }
+        .account-meta { font-size: 0.75em; color: #606070; }
+        .status { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.7em; text-transform: uppercase; }
+        .status-ready { background: #1a2e1a; color: #00ff88; }
+        .status-active { background: #1a2e2e; color: #00ffcc; }
+        .status-collecting { background: #2e2e1a; color: #ffcc00; }
+        .status-error { background: #2e1a1a; color: #ff4444; }
+        .status-cooldown { background: #1a1a2e; color: #8888ff; }
+        .results-log { max-height: 400px; overflow-y: auto; font-family: 'JetBrains Mono', monospace; font-size: 0.8em; }
+        .result-entry { padding: 6px 10px; border-left: 3px solid #2a2a3e; margin-bottom: 4px; }
+        .result-success { border-left-color: #00ff88; }
+        .result-fail { border-left-color: #ff4444; }
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 20px; }
+        .stat-box { text-align: center; padding: 15px; background: #0a0a12; border-radius: 8px; }
+        .stat-value { font-size: 1.8em; font-weight: bold; color: #00ff88; }
+        .stat-label { font-size: 0.75em; color: #606070; margin-top: 4px; }
+        @media (max-width: 768px) { .grid { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>⚡ BGMI Event Bot</h1>
+            <span class="badge">ITOP SDK v2.10.3</span>
+        </header>
+
+        <div class="stats">
+            <div class="stat-box">
+                <div class="stat-value" id="stat-accounts">0</div>
+                <div class="stat-label">Accounts</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value" id="stat-collected">0</div>
+                <div class="stat-label">Rewards Collected</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value" id="stat-protocol">HTTPS</div>
+                <div class="stat-label">Protocol</div>
+            </div>
+        </div>
+
+        <div class="grid">
+            <div class="card">
+                <h2>Add Account</h2>
+                <form id="add-form">
+                    <div class="form-group">
+                        <label>Label</label>
+                        <input type="text" id="acc-label" placeholder="My account" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Login Method</label>
+                        <select id="acc-type" onchange="toggleFields()">
+                            <option value="twitter">Twitter/X</option>
+                            <option value="facebook">Facebook</option>
+                            <option value="google">Google</option>
+                            <option value="guest">Guest</option>
+                        </select>
+                    </div>
+                    <div class="form-group" id="field-oauth-token">
+                        <label>OAuth Token</label>
+                        <input type="text" id="acc-oauth-token" placeholder="2059972254298206209-qcUz8Rc...">
+                    </div>
+                    <div class="form-group" id="field-oauth-secret">
+                        <label>OAuth Token Secret</label>
+                        <input type="text" id="acc-oauth-secret" placeholder="5Lpa3xOvxLxg...">
+                    </div>
+                    <div class="form-group" id="field-access-token" style="display:none">
+                        <label>Access Token</label>
+                        <input type="text" id="acc-access-token">
+                    </div>
+                    <div class="form-group">
+                        <label>Device ID (optional)</label>
+                        <input type="text" id="acc-device-id" placeholder="auto-generated if empty">
+                    </div>
+                    <button type="submit" class="btn btn-primary">Add Account</button>
+                </form>
+            </div>
+
+            <div class="card">
+                <h2>Accounts</h2>
+                <ul class="account-list" id="account-list">
+                    <li style="color:#606070;padding:10px;">No accounts added yet</li>
+                </ul>
+                <div style="margin-top:15px;">
+                    <button class="btn btn-primary" onclick="collectAll()">Collect All</button>
+                </div>
+            </div>
+
+            <div class="card" style="grid-column: 1 / -1;">
+                <h2>Collection Log</h2>
+                <div class="results-log" id="results-log">
+                    <div style="color:#606070;padding:10px;">Waiting for collection results...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    function toggleFields() {
+        const type = document.getElementById('acc-type').value;
+        document.getElementById('field-oauth-token').style.display = (type === 'twitter') ? '' : 'none';
+        document.getElementById('field-oauth-secret').style.display = (type === 'twitter') ? '' : 'none';
+        document.getElementById('field-access-token').style.display = (type === 'facebook' || type === 'google') ? '' : 'none';
+    }
+
+    document.getElementById('add-form').onsubmit = async (e) => {
+        e.preventDefault();
+        const body = {
+            label: document.getElementById('acc-label').value,
+            credential_type: document.getElementById('acc-type').value,
+            oauth_token: document.getElementById('acc-oauth-token').value || null,
+            oauth_token_secret: document.getElementById('acc-oauth-secret').value || null,
+            access_token: document.getElementById('acc-access-token').value || null,
+            device_id: document.getElementById('acc-device-id').value || null,
+        };
+        const resp = await fetch('/api/accounts', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+        const data = await resp.json();
+        if (data.success) { loadAccounts(); e.target.reset(); }
+        else alert(data.error);
+    };
+
+    async function loadAccounts() {
+        const resp = await fetch('/api/accounts');
+        const data = await resp.json();
+        const list = document.getElementById('account-list');
+        if (!data.success || !data.data.length) {
+            list.innerHTML = '<li style="color:#606070;padding:10px;">No accounts added yet</li>';
+            document.getElementById('stat-accounts').textContent = '0';
+            return;
+        }
+        document.getElementById('stat-accounts').textContent = data.data.length;
+        list.innerHTML = data.data.map(a => `
+            <li class="account-item">
+                <div class="account-info">
+                    <span class="account-label">${a.label}</span>
+                    <span class="account-meta">${a.credential_type} | ${a.openid || 'not logged in'}</span>
+                </div>
+                <div>
+                    <span class="status status-${a.status}">${a.status}</span>
+                    <button class="btn btn-secondary" onclick="collectSingle('${a.id}')" style="margin-left:8px;">Collect</button>
+                    <button class="btn btn-danger" onclick="removeAccount('${a.id}')" style="margin-left:4px;">×</button>
+                </div>
+            </li>
+        `).join('');
+    }
+
+    async function collectSingle(id) {
+        const resp = await fetch(`/api/collect/${id}`, { method: 'POST' });
+        const data = await resp.json();
+        loadResults();
+        loadAccounts();
+    }
+
+    async function collectAll() {
+        const resp = await fetch('/api/collect-all', { method: 'POST' });
+        loadResults();
+        loadAccounts();
+    }
+
+    async function removeAccount(id) {
+        await fetch(`/api/accounts/${id}`, { method: 'DELETE' });
+        loadAccounts();
+    }
+
+    async function loadResults() {
+        const resp = await fetch('/api/results');
+        const data = await resp.json();
+        const log = document.getElementById('results-log');
+        if (!data.success || !data.data.length) return;
+        document.getElementById('stat-collected').textContent = data.data.filter(([_,r]) => r.success).length;
+        log.innerHTML = data.data.slice(-50).reverse().map(([aid, r]) => `
+            <div class="result-entry ${r.success ? 'result-success' : 'result-fail'}">
+                <strong>${r.event_type}</strong> - ${r.message}
+                ${r.reward_desc ? ` | ${r.reward_desc}` : ''}
+                <span style="float:right;color:#606070;">${new Date(r.timestamp).toLocaleTimeString()}</span>
+            </div>
+        `).join('');
+    }
+
+    loadAccounts();
+    setInterval(loadResults, 5000);
+    </script>
+</body>
+</html>

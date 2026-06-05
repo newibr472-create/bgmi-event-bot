@@ -1,79 +1,36 @@
-#![allow(dead_code)]
-
 mod core;
 mod network;
 mod ui;
 
-use anyhow::Result;
 use std::sync::Arc;
 use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::core::account::AccountManager;
-use crate::core::events::EventScheduler;
-use crate::ui::web::start_server;
-
-pub struct AppState {
-    pub accounts: AccountManager,
-    pub event_scheduler: EventScheduler,
-    pub bot_running: parking_lot::RwLock<bool>,
-    pub logs: parking_lot::RwLock<Vec<LogEntry>>,
-    pub shutdown: tokio::sync::broadcast::Sender<()>,
-}
-
-#[derive(Clone, serde::Serialize)]
-pub struct LogEntry {
-    pub timestamp: chrono::DateTime<chrono::Utc>,
-    pub message: String,
-}
-
-impl AppState {
-    fn new() -> Self {
-        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
-        Self {
-            accounts: AccountManager::new(),
-            event_scheduler: EventScheduler::new(),
-            bot_running: parking_lot::RwLock::new(false),
-            logs: parking_lot::RwLock::new(Vec::new()),
-            shutdown: shutdown_tx,
-        }
-    }
-
-    pub fn push_log(&self, message: impl Into<String>) {
-        let entry = LogEntry {
-            timestamp: chrono::Utc::now(),
-            message: message.into(),
-        };
-        let mut logs = self.logs.write();
-        logs.push(entry);
-        if logs.len() > 200 {
-            logs.drain(0..50);
-        }
-    }
-}
+use crate::core::session::SessionManager;
+use crate::ui::web::{build_router, AppState};
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("bgmi_event_bot=debug,warn")
-        .with_target(false)
-        .compact()
+async fn main() {
+    // init logging
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "bgmi_event_bot=debug,tower_http=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
         .init();
 
     info!("bgmi-event-bot v{}", env!("CARGO_PKG_VERSION"));
+    info!("protocol: ITOP SDK v2.10.3 / globh.com HTTPS");
 
-    let state = Arc::new(AppState::new());
-    let state_clone = state.clone();
+    let session_mgr = Arc::new(SessionManager::new());
+    let state: AppState = session_mgr;
 
-    // spawn background event scheduler
-    tokio::spawn(async move {
-        let scheduler = state_clone.event_scheduler.clone();
-        if let Err(e) = scheduler.run_loop().await {
-            tracing::warn!("event scheduler exited: {}", e);
-        }
-    });
+    let app = build_router(state);
 
-    // start web server
-    start_server(state).await?;
+    let bind = "0.0.0.0:3000";
+    info!("dashboard running at http://localhost:3000");
 
-    Ok(())
+    let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
