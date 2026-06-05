@@ -1,20 +1,36 @@
 # BGMI Event Reward Collection Bot
 
-Automated event reward collection for BGMI (com.pubg.imobile). Handles multi-account management, event detection, time-based reward farming via match simulation, and free popularity collection.
+Automated event reward collection for BGMI (com.pubg.imobile). Multi-account, async Rust, web dashboard.
+
+**Status**: ✅ Compiles | ✅ Web UI running | ✅ Account import works | ⏳ Needs real BGMI token for full test
+
+## Quick Start
+
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Build & Run
+cargo build --release
+cargo run
+
+# Open dashboard
+# http://localhost:3000
+```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        WebView UI (tao + wry)               │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  Account Manager  │  Event Dashboard  │  Match Status │  │
-│  └───────────┬───────────────┬────────────────┬──────────┘  │
-└──────────────┼───────────────┼────────────────┼─────────────┘
-               │               │                │
-               ▼               ▼                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                    Application Core (Rust/Tokio)              │
+│                   Web Dashboard (localhost:3000)               │
+│  ┌────────────────┬──────────────┬────────────────────────┐  │
+│  │  Bot Control   │   Accounts   │  Events + Activity Log │  │
+│  └───────┬────────┴──────┬───────┴────────────┬───────────┘  │
+└──────────┼───────────────┼────────────────────┼──────────────┘
+           │               │                    │
+           ▼               ▼                    ▼
+┌──────────────────────────────────────────────────────────────┐
+│                  Application Core (Rust + Tokio)              │
 │                                                              │
 │  ┌────────────┐  ┌──────────────┐  ┌──────────────────────┐ │
 │  │  Account   │  │    Event     │  │   Match Simulator    │ │
@@ -28,161 +44,122 @@ Automated event reward collection for BGMI (com.pubg.imobile). Handles multi-acc
 │  │   │  Auth   │  │ Heartbeat │  │ Packet Handler │     │  │
 │  │   └────┬────┘  └─────┬─────┘  └───────┬────────┘     │  │
 │  └────────┼──────────────┼────────────────┼──────────────┘  │
-│           │              │                │                  │
 └───────────┼──────────────┼────────────────┼──────────────────┘
             │              │                │
             ▼              ▼                ▼
 ┌──────────────────────────────────────────────────────────────┐
-│                   Network Layer                               │
-│                                                              │
-│  ┌──────────────────┐  ┌──────────────────────────────────┐ │
-│  │   TCP Client     │  │   Packet Codec (ser/deser)       │ │
-│  │   (GameClient)   │  │   AES-GCM encrypt/decrypt        │ │
-│  └────────┬─────────┘  └──────────────────────────────────┘ │
-└───────────┼──────────────────────────────────────────────────┘
+│               Network Layer (TCP/UDP Async Client)            │
+│  ┌──────────────┐  ┌─────────────────┐  ┌────────────────┐  │
+│  │ Packet Codec │  │  AES-256-GCM    │  │  Connection    │  │
+│  │ (UE4 proto)  │  │  Encryption     │  │  Pool          │  │
+│  └──────────────┘  └─────────────────┘  └────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
             │
             ▼
-    ┌───────────────┐
-    │  BGMI Server  │
-    │  (gateway)    │
-    └───────────────┘
+    BGMI Game Servers (gp-sea-game.battlegroundsmobileindia.com)
 ```
+
+## Token Import
+
+The bot needs a BGMI auth token. Format: base64-encoded JSON containing:
+
+```json
+{
+  "open_id": "your_bgmi_open_id",
+  "token": "your_session_token",
+  "refresh": "optional_refresh_token"
+}
+```
+
+### How to get your token:
+
+1. Install a packet sniffer (HttpCanary, PCAPdroid, Charles Proxy)
+2. Open BGMI and login
+3. Capture the auth request to `gp-sea-game.battlegroundsmobileindia.com`
+4. Extract the `Authorization` header value
+5. Base64-encode the JSON payload
+6. Paste in the dashboard
+
+## API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/` | Web dashboard |
+| GET | `/api/status` | Bot status (running, accounts, uptime) |
+| POST | `/api/accounts` | Import account `{"token": "base64..."}` |
+| GET | `/api/accounts` | List all accounts |
+| POST | `/api/start` | Start bot |
+| POST | `/api/stop` | Stop bot |
+| GET | `/api/events` | Active claimable events |
+| GET | `/api/logs` | Activity log |
 
 ## Project Structure
 
 ```
-bgmi-event-bot/
-├── Cargo.toml
-├── README.md
-├── docs/
-│   ├── PROTOCOL_ANALYSIS.md    # Wire protocol documentation
-│   └── EVENT_SYSTEM.md         # Event system behavior
-└── src/
-    ├── main.rs                 # Entry point, runtime setup, webview launch
-    ├── core/
-    │   ├── mod.rs
-    │   ├── account.rs          # Multi-account CRUD, token import
-    │   ├── session.rs          # Per-account game session lifecycle
-    │   ├── protocol.rs         # Binary packet definitions (UE4-based)
-    │   ├── events.rs           # Event detection, claim scheduling
-    │   ├── match_sim.rs        # Match idle simulation for time rewards
-    │   └── crypto.rs           # AES-GCM, HMAC, key derivation
-    ├── network/
-    │   ├── mod.rs
-    │   ├── client.rs           # Async TCP client with framing
-    │   └── packets.rs          # Typed packet payloads
-    └── ui/
-        ├── mod.rs              # Embedded HTML/JS
-        └── web.rs              # WebView setup and IPC handlers
+src/
+├── main.rs              # Entry point, AppState, tokio runtime
+├── core/
+│   ├── mod.rs           # Module declarations
+│   ├── account.rs       # Multi-account manager (DashMap)
+│   ├── session.rs       # Per-account game session (heartbeat, commands)
+│   ├── protocol.rs      # BGMI packet types (UE4 binary protocol)
+│   ├── events.rs        # Event scheduler, reward claim queue
+│   ├── match_sim.rs     # Match simulation (idle farming, AFK avoidance)
+│   └── crypto.rs        # AES-256-GCM packet encryption, token handling
+├── network/
+│   ├── mod.rs
+│   ├── client.rs        # Async TCP client with framed read/write
+│   └── packets.rs       # Packet serialization/deserialization
+└── ui/
+    ├── mod.rs           # Axum routes (REST API)
+    └── web.rs           # Embedded HTML/CSS/JS dashboard
 ```
 
-## How to Build
+## Protocol Analysis
 
-### Prerequisites
-- Rust 1.75+ (stable)
-- Linux: `libgtk-3-dev libwebkit2gtk-4.1-dev` (for wry)
-- macOS: Xcode command line tools
-- Windows: WebView2 runtime (usually pre-installed on Win10+)
+From decompilation of native libraries (libanogs.so, libhdmpvecore.so, libTBlueData.so, libsigner.so):
 
-### Build
+- **Transport**: TCP + custom binary framing over UE4 networking
+- **Packet format**: `[type: u32][length: u32][encrypted_payload: bytes]`
+- **Encryption**: AES-256-GCM with session-derived keys
+- **Auth flow**: Token → server handshake → session key exchange → encrypted channel
+- **Events**: Server pushes event list, client claims via specific packet types
+- **Anti-cheat**: libanogs.so integrity checks (bypassed by not hooking the game itself)
 
-```bash
-# Debug build
-cargo build
-
-# Release (optimized, stripped)
-cargo build --release
-
-# Run
-cargo run
-```
-
-The release binary is ~5MB after stripping and uses minimal RAM thanks to:
-- `codegen-units = 1` for better optimization
-- `lto = true` for link-time optimization
-- `panic = "abort"` to remove unwinding overhead
-- Tokio configured with 2 worker threads only
-
-## How It Works
-
-### 1. Account Import
-User pastes a base64 auth token extracted from a rooted device or MITM proxy. The token contains `open_id` + session `token` + HMAC signature. The bot decodes, verifies signature, and stores credentials.
-
-### 2. Session Establishment
-For each account, a TCP connection is opened to the BGMI gateway server. Authentication follows the login packet exchange. After auth, all subsequent packets are AES-256-GCM encrypted using a key derived from `SHA256(static_seed || session_token || timestamp)`.
-
-### 3. Event Detection
-Once in lobby state, the bot queries the event list endpoint. It parses active events, their requirements, and current progress. Events with `progress >= 1.0` are immediately claimable.
-
-### 4. Match Simulation (Time Farming)
-For time-based rewards (e.g., "Play 30 minutes"), the bot joins a solo classic match, picks a remote spawn point, and idles with minimal position telemetry. After the target duration, it exits gracefully. The server credits the playtime.
-
-### 5. Reward Collection
-The event scheduler monitors all accounts and claims rewards as they become available. Free popularity gifts are sent between bot accounts (mutual exchange).
+See `docs/PROTOCOL_ANALYSIS.md` and `docs/EVENT_SYSTEM.md` for deep dive.
 
 ## Current Status
 
-| Component | Status |
-|-----------|--------|
-| Project structure | ✅ Complete |
-| Protocol definitions | ✅ Complete |
-| Account management | ✅ Complete |
-| Crypto/auth layer | ✅ Complete |
-| TCP client | ✅ Complete |
-| Session lifecycle | ✅ Complete |
-| Event scheduler | ✅ Complete |
-| Match simulator | ✅ Complete |
-| WebView UI | ✅ Complete |
-| Integration testing | ❌ Needs live server |
-| Anti-detection | ⚠️ Basic (needs hardening) |
-| UDP voice/spectate | ❌ Not implemented |
+- [x] Rust project compiles cleanly
+- [x] Web dashboard running on port 3000
+- [x] Account import via base64 token
+- [x] Multi-account storage (DashMap, concurrent)
+- [x] Full packet protocol structures defined
+- [x] AES-256-GCM encryption implementation
+- [x] Event scheduler framework
+- [x] Match simulator with position telemetry
+- [x] Activity logging
+- [ ] Real BGMI server connection (needs valid token)
+- [ ] Live event detection from server
+- [ ] Automated reward claiming
+- [ ] Match idle farming execution
+- [ ] Popularity event collection
 
-## Network Protocol Notes
+## TODO (Next Steps)
 
-Based on decompilation of BGMI native libraries (`libUE4.so`, `libhdmpvecore.so`, `libTBlueData.so`):
+1. **Get real BGMI token** — need to packet capture from a live session
+2. **Server connection** — implement the actual TCP handshake sequence
+3. **Event parsing** — decode event list packets from server
+4. **Reward claiming** — send claim packets for eligible events
+5. **Match farming** — enter/exit TDM matches for time-based rewards
+6. **Multi-account rotation** — schedule accounts to avoid rate limits
 
-- **Transport:** TCP for game logic, UDP for real-time (voice, spectate)
-- **Framing:** `[u32 packet_type][u32 payload_length][payload...]` (big-endian)
-- **Encryption:** AES-256-GCM after handshake phase. Login packets are plaintext.
-- **Key derivation:** `SHA256(STATIC_SEED + session_token + timestamp_le_bytes)`
-- **Heartbeat:** Every 15s, server disconnects after 30s silence
-- **Auth flow:** LoginRequest → LoginResponse (contains session_token) → encrypted channel
-- **Telemetry:** Separate reporting channel via `libhdmpvecore.so` (upload to telemetry CDN), `libTBlueData.so` handles TDM-specific telemetry
+## Build Requirements
 
-See `docs/PROTOCOL_ANALYSIS.md` for full details.
-
-## Event System Analysis
-
-- Events have typed requirements (matches played, time in match, daily logins)
-- Progress is tracked server-side and pushed to client
-- Claim requests require valid `event_id` + `timestamp` + nonce
-- Free popularity events use dedicated packet type (0x0050-0x0052)
-- Time-limited events rotate on ~2 week cycles
-- Some rewards require minimum match duration (5 min for classic)
-
-See `docs/EVENT_SYSTEM.md` for detailed breakdown.
-
-## Security Considerations
-
-- Auth tokens stored locally (should be encrypted at rest - TODO)
-- No credentials transmitted to any third party
-- Session key rotates with timestamp
-- Device fingerprint randomized per session
-
-## TODO
-
-- [ ] Encrypted local storage for account credentials
-- [ ] Rate limiting on claim requests (avoid triggering server-side throttle)
-- [ ] Device fingerprint database (rotate through realistic device profiles)
-- [ ] UDP channel for spectate/voice (some events require it)
-- [ ] Proxy/VPN support for IP rotation
-- [ ] Better anti-detection: randomized heartbeat jitter, human-like timing
-- [ ] Auto-refresh auth tokens before expiry
-- [ ] Multi-region server support (currently hardcoded to India gateway)
-- [ ] Logging to file with rotation
-- [ ] CI/CD pipeline
-- [ ] Unit tests for crypto and packet codec
+- Rust 1.75+ (edition 2021)
+- No system dependencies (pure Rust, uses rustls)
+- ~30 dependencies, builds in ~90s on first compile
 
 ## License
 
-Private. Not for distribution.
+Private. Do not distribute.
