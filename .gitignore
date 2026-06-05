@@ -1,0 +1,8 @@
+/target
+Cargo.lock
+*.swp
+*.swo
+.env
+accounts.json
+*.log
+.DS_Store
