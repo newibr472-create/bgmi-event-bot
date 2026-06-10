@@ -2,5 +2,8 @@ pub mod account;
 pub mod captured_auth;
 pub mod crypto;
 pub mod events;
+pub mod lobby;
+pub mod match_conn;
+pub mod orchestrator;
 pub mod protocol;
 pub mod session;
